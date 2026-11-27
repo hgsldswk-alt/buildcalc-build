@@ -1,0 +1,229 @@
+import XCTest
+
+final class FlowUITests: XCTestCase {
+    private let floor: [String: String] = ["LENGTH": "4", "WIDTH": "3", "COVERAGE": "2.20"]
+
+    override func setUpWithError() throws { continueAfterFailure = false; executionTimeAllowance = 900 }
+
+    func testAAAWarmUpSimulator() {
+        XCTExpectFailure("云端模拟器首次启动可能超时", strict: false)
+        launch().terminate()
+    }
+
+    private func launch(language: String = "zh-Hans", flags: [String] = ["-reset"], fields: [String: String] = [:]) -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchArguments = ["-ui-testing", "-AppleLanguages", "(\(language))", "-AppleLocale", language == "en" ? "en_US" : language == "zh-Hant" ? "zh_TW" : language == "ja" ? "ja_JP" : "zh_CN"] + flags
+        app.launchEnvironment = ["BUILDCALC_SYSTEM": "metric"]
+        for (key, value) in fields { app.launchEnvironment["BUILDCALC_" + key] = value }
+        app.launch()
+        return app
+    }
+
+    private func waitForHittable(_ element: XCUIElement, file: StaticString = #filePath, line: UInt = #line) {
+        let ready = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true AND enabled == true AND hittable == true"), object: element
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 15), .completed,
+                       "Element never became ready: \(element.debugDescription)", file: file, line: line)
+    }
+
+    private func calculate(_ app: XCUIApplication, file: StaticString = #filePath, line: UInt = #line) {
+        let button = app.buttons["home.calculate"]
+        waitForHittable(button, file: file, line: line)
+        button.tap()
+    }
+
+    private func verify(_ app: XCUIApplication, quantity: String) {
+        let result = app.staticTexts["result.quantity"]
+        XCTAssertTrue(result.waitForExistence(timeout: 5))
+        let rest = result.label.dropFirst(quantity.count)
+        XCTAssertTrue(result.label.hasPrefix(quantity) && !(rest.first.map { $0.isNumber || $0 == "." || $0 == "," } ?? false), result.label)
+    }
+
+    private func screenshot(_ app: XCUIApplication, _ name: String) {
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    func testCalculateAndShareThenInvalidateWithKeyboardUp() {
+        let app = launch(flags: ["-reset", "-share-shot"], fields: floor)
+        calculate(app)
+        verify(app, quantity: "6")
+        let share = app.buttons["result.share"]
+        waitForHittable(share)
+        share.tap()
+        let preview = app.images["share.previewCard"]
+        let close = app.buttons["share.previewDone"]
+        XCTAssertTrue(preview.waitForExistence(timeout: 12))
+        waitForHittable(close)
+        close.tap()
+        let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: close)
+        XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 12), .completed, "Share preview did not close")
+        waitForHittable(share)
+
+        let coverage = app.textFields["field.coverage"]
+        let scroll = app.scrollViews.firstMatch
+        for _ in 0..<3 {
+            if coverage.isHittable { break }
+            scroll.swipeDown()
+        }
+        waitForHittable(coverage)
+        coverage.tap()
+        coverage.typeText("1")
+        XCTAssertFalse(app.buttons["result.share"].exists)
+        XCTAssertTrue(app.keyboards.firstMatch.exists)
+        calculate(app)
+        verify(app, quantity: "6")
+    }
+
+    func testInitialInputMissingAndReuseDimensions() {
+        let app = launch()
+        let length = app.textFields["field.length"]
+        XCTAssertTrue(length.waitForExistence(timeout: 6))
+        length.tap()
+        length.typeText("4")
+        let width = app.textFields["field.width"]
+        width.tap()
+        width.typeText("3")
+        calculate(app)
+        XCTAssertTrue(app.staticTexts["error.coverage"].waitForExistence(timeout: 4))
+        let coverage = app.textFields["field.coverage"]
+        let deadline = Date().addingTimeInterval(8)
+        while !coverage.isHittable && Date() < deadline { usleep(300_000) }
+        coverage.tap()
+        coverage.typeText("2.20")
+        calculate(app)
+        verify(app, quantity: "6")
+        app.scrollViews.firstMatch.swipeDown()
+        app.buttons["mode.panel"].tap()
+        XCTAssertEqual(app.textFields["field.length"].value as? String, "4")
+        XCTAssertEqual(app.textFields["field.width"].value as? String, "3")
+        XCTAssertEqual(app.textFields["field.waste"].value as? String, "10")
+        calculate(app)
+        XCTAssertTrue(app.staticTexts["error.coverage"].waitForExistence(timeout: 4))
+    }
+
+    func testUnitToggleAndLiveConversion() {
+        let app = launch(fields: floor.merging(["CONVERSION": "12′ 7 1/2″"], uniquingKeysWith: { _, new in new }))
+        app.buttons["unit.imperial"].tap()
+        app.buttons["unit.metric"].tap()
+        XCTAssertEqual(app.textFields["field.coverage"].value as? String, "2.20")
+        calculate(app)
+        verify(app, quantity: "6")
+        app.scrollViews.firstMatch.swipeDown()
+        app.buttons["mode.convert"].tap()
+        XCTAssertTrue(app.staticTexts["conversion.metric"].label.contains("3.8481"))
+        XCTAssertTrue(app.staticTexts["conversion.area"].label.contains("12.00"))
+    }
+
+    func testHistoryAndImportAcrossLaunches() {
+        let app = launch(fields: floor)
+        calculate(app)
+        verify(app, quantity: "6")
+        app.buttons["home.recent"].tap()
+        XCTAssertTrue(app.buttons["history.record"].firstMatch.waitForExistence(timeout: 6))
+        app.terminate()
+        let history = launch(flags: ["-share-shot"])
+        history.buttons["home.recent"].tap()
+        let record = history.buttons["history.record"].firstMatch
+        XCTAssertTrue(record.waitForExistence(timeout: 6))
+        record.tap()
+        verify(history, quantity: "6")
+        history.scrollViews.firstMatch.swipeUp()
+        XCTAssertTrue(history.buttons["history.recalculate"].exists)
+        XCTAssertTrue(history.buttons["history.share"].exists)
+        history.buttons["history.share"].tap()
+        XCTAssertTrue(history.images["share.previewCard"].waitForExistence(timeout: 12), "History share image was not rendered")
+        history.terminate()
+
+        let transfer = launch(flags: [], fields: ["IMPORT": fixtureCode() + "\n"])
+        transfer.buttons["home.import"].tap()
+        let openTransfer = transfer.buttons["import.open"]
+        waitForHittable(openTransfer)
+        openTransfer.tap()
+        verify(transfer, quantity: "6")
+        transfer.scrollViews.firstMatch.swipeUp()
+        XCTAssertTrue(transfer.buttons["history.recalculate"].exists)
+        transfer.terminate()
+        let duplicate = launch(flags: [], fields: ["IMPORT": fixtureCode()])
+        duplicate.buttons["home.import"].tap()
+        let openDuplicate = duplicate.buttons["import.open"]
+        waitForHittable(openDuplicate)
+        openDuplicate.tap()
+        verify(duplicate, quantity: "6")
+        duplicate.terminate()
+        let reopened = launch(flags: [])
+        reopened.buttons["home.recent"].tap()
+        XCTAssertTrue(reopened.buttons["history.record"].firstMatch.waitForExistence(timeout: 6))
+        XCTAssertEqual(reopened.buttons.matching(identifier: "history.record").count, 2)
+    }
+
+    func testInvalidCodeLeavesImportOpen() {
+        let app = launch(fields: ["IMPORT": "MAT1:bad\ncode"])
+        app.buttons["home.import"].tap()
+        app.buttons["import.open"].tap()
+        XCTAssertTrue(app.staticTexts["import.error"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.staticTexts["result.quantity"].exists)
+    }
+
+    func testPaintVolumeSwitchDoesNotChangeStoredInputs() {
+        let app = launch(fields: ["MODE": "paint", "MATERIAL": "paint", "LENGTH": "4", "WIDTH": "3", "COVERAGE": "10", "CAPACITY": "2.5"])
+        let metric = app.buttons["unit.metric"]
+        XCTAssertTrue(metric.waitForExistence(timeout: 6))
+        app.buttons["unit.imperial"].tap()
+        XCTAssertNotEqual(app.textFields["field.capacity"].value as? String, "2.5")
+        metric.tap()
+        XCTAssertEqual(app.textFields["field.capacity"].value as? String, "2.5")
+        XCTAssertEqual(app.textFields["field.coverage"].value as? String, "10")
+        calculate(app)
+        verify(app, quantity: "2")
+    }
+
+    func testLargeText() {
+        let app = launch(flags: ["-reset", "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityExtraExtraExtraLarge"], fields: floor)
+        calculate(app)
+        verify(app, quantity: "6")
+        XCTAssertTrue(app.buttons["result.share"].exists)
+    }
+
+    func testStoreEnglish() { storeShots("en") }
+    func testStoreSimplifiedChinese() { storeShots("zh-Hans") }
+    func testStoreTraditionalChinese() { storeShots("zh-Hant") }
+    func testStoreJapanese() { storeShots("ja") }
+
+    private func storeShots(_ language: String) {
+        let prefix = "store-" + language + "-"
+        let app = launch(language: language)
+        XCTAssertTrue(app.textFields["field.length"].waitForExistence(timeout: 6))
+        screenshot(app, prefix + "01-home")
+        app.terminate()
+
+        let estimate = launch(language: language, flags: ["-reset", "-share-shot"], fields: floor)
+        calculate(estimate)
+        verify(estimate, quantity: "6")
+        screenshot(estimate, prefix + "02-floor")
+        estimate.buttons["result.share"].tap()
+        XCTAssertTrue(estimate.images["share.previewCard"].waitForExistence(timeout: 6))
+        screenshot(estimate, prefix + "05-share")
+        estimate.terminate()
+
+        let convert = launch(language: language, fields: ["MODE": "conversion", "CONVERSION": "12′ 7 1/2″", "LENGTH": "4", "WIDTH": "3"])
+        XCTAssertTrue(convert.staticTexts["conversion.metric"].waitForExistence(timeout: 6))
+        screenshot(convert, prefix + "03-convert")
+        convert.terminate()
+
+        let paint = launch(language: language, fields: ["MODE": "paint", "MATERIAL": "paint", "LENGTH": "4", "WIDTH": "3", "COVERAGE": "10", "CAPACITY": "2.5"])
+        XCTAssertTrue(paint.textFields["field.coats"].waitForExistence(timeout: 6))
+        screenshot(paint, prefix + "04-paint")
+        calculate(paint)
+        verify(paint, quantity: "2")
+    }
+
+    private func fixtureCode() -> String {
+        let source = #"{"formulaVersion":1,"input":{"coverage":{"system":"metric","text":"2.20","volume":"liter"},"length":{"system":"metric","text":"4","volume":"liter"},"material":"floor","waste":{"system":"metric","text":"8","volume":"liter"},"width":{"system":"metric","text":"3","volume":"liter"}},"version":1}"#
+        return "MAT1:" + Data(source.utf8).base64EncodedString().replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+    }
+}
